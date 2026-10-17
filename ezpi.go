@@ -30,17 +30,19 @@ type App struct {
 	// The signing secret comes from the EZPI_SECRET env var.
 	Private *Router
 
-	mux      *http.ServeMux
-	handler  http.Handler
-	log      *slog.Logger
-	secret   []byte
-	dev      bool
-	maxBody  int64
-	origins  map[string]bool
-	limiter  *limiter
-	tokenTTL time.Duration
-	onError  func(Err) any
-	private  bool // true once a private route is registered
+	mux        *http.ServeMux
+	handler    http.Handler
+	log        *slog.Logger
+	secret     []byte
+	dev        bool
+	maxBody    int64
+	origins    map[string]bool
+	limiter    *limiter
+	tokenTTL   time.Duration
+	onError    func(Err) any
+	trustProxy bool
+	private    bool // true once a private route is registered
+	routes     []*Route
 }
 
 // New creates an app with secure defaults turned on.
@@ -66,25 +68,64 @@ func New() *App {
 type Router struct {
 	app     *App
 	private bool
+	prefix  string
 }
 
-func (r *Router) Get(path string, handler any)    { r.handle(http.MethodGet, path, handler) }
-func (r *Router) Post(path string, handler any)   { r.handle(http.MethodPost, path, handler) }
-func (r *Router) Put(path string, handler any)    { r.handle(http.MethodPut, path, handler) }
-func (r *Router) Patch(path string, handler any)  { r.handle(http.MethodPatch, path, handler) }
-func (r *Router) Delete(path string, handler any) { r.handle(http.MethodDelete, path, handler) }
+func (r *Router) Get(path string, handler any) *Route {
+	return r.handle(http.MethodGet, path, handler)
+}
 
-func (r *Router) handle(method, path string, handler any) {
+func (r *Router) Post(path string, handler any) *Route {
+	return r.handle(http.MethodPost, path, handler)
+}
+
+func (r *Router) Put(path string, handler any) *Route {
+	return r.handle(http.MethodPut, path, handler)
+}
+
+func (r *Router) Patch(path string, handler any) *Route {
+	return r.handle(http.MethodPatch, path, handler)
+}
+
+func (r *Router) Delete(path string, handler any) *Route {
+	return r.handle(http.MethodDelete, path, handler)
+}
+
+// Group returns a router whose routes all start with prefix:
+//
+//	v1 := app.Group("/v1")
+//	v1.Get("/users", listUsers) // GET /v1/users
+//
+// Groups of app.Private are private too.
+func (r *Router) Group(prefix string) *Router {
+	return &Router{app: r.app, private: r.private, prefix: joinPath(r.prefix, prefix)}
+}
+
+func (r *Router) handle(method, path string, handler any) *Route {
+	path = joinPath(r.prefix, path)
 	pattern, params := convertPath(path)
-	route := method + " " + path
-	h, err := r.app.build(method, params, r.private, handler)
+	rt := &Route{method: method, path: pattern, private: r.private}
+	h, err := r.app.build(rt, params, handler)
 	if err != nil {
-		panic(fmt.Sprintf("ezpi: %s: %v", route, err))
+		panic(fmt.Sprintf("ezpi: %s %s: %v", method, path, err))
 	}
 	if r.private {
 		r.app.private = true
 	}
 	r.app.mux.Handle(method+" "+pattern, h)
+	r.app.routes = append(r.app.routes, rt)
+	return rt
+}
+
+func joinPath(prefix, path string) string {
+	if prefix == "" {
+		return path
+	}
+	prefix = "/" + strings.Trim(prefix, "/")
+	if path == "" || path == "/" {
+		return prefix
+	}
+	return prefix + "/" + strings.TrimPrefix(path, "/")
 }
 
 // convertPath turns "/users/:id" into "/users/{id}" and returns the param names.
@@ -121,6 +162,12 @@ func (a *App) CORS(origins ...string) {
 // RateLimit sets how many requests per minute each IP may make. 0 turns it off.
 // The default is 300.
 func (a *App) RateLimit(perMinute int) { a.limiter = newLimiter(perMinute) }
+
+// TrustProxy tells ezpi it runs behind a reverse proxy or load balancer
+// (nginx, Cloudflare, Fly, Render, ...), so the client IP is read from
+// X-Forwarded-For. Only turn this on if a proxy is really in front:
+// otherwise clients can fake their IP and dodge the rate limit.
+func (a *App) TrustProxy() { a.trustProxy = true }
 
 // MaxBody sets the largest request body allowed, in bytes. The default is 1 MB.
 func (a *App) MaxBody(bytes int64) { a.maxBody = bytes }

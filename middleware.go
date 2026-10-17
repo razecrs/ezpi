@@ -11,12 +11,20 @@ import (
 	"time"
 )
 
-type requestIDKey struct{}
+type metaKey struct{}
 
-func requestID(r *http.Request) string {
-	id, _ := r.Context().Value(requestIDKey{}).(string)
-	return id
+// meta is per-request info set once by the middleware.
+type meta struct {
+	id string
+	ip string
 }
+
+func requestMeta(r *http.Request) meta {
+	m, _ := r.Context().Value(metaKey{}).(meta)
+	return m
+}
+
+func requestID(r *http.Request) string { return requestMeta(r).id }
 
 func newRequestID() string {
 	b := make([]byte, 8)
@@ -50,8 +58,8 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 func (a *App) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		id := newRequestID()
-		r = r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id))
+		id, ip := newRequestID(), a.clientIP(r)
+		r = r.WithContext(context.WithValue(r.Context(), metaKey{}, meta{id: id, ip: ip}))
 		w := &statusWriter{ResponseWriter: rw}
 
 		defer func() {
@@ -62,7 +70,7 @@ func (a *App) middleware(next http.Handler) http.Handler {
 				}
 			}
 			a.log.Info("request", "request_id", id, "method", r.Method, "path", r.URL.Path,
-				"status", w.status, "ms", time.Since(start).Milliseconds(), "ip", clientIP(r))
+				"status", w.status, "ms", time.Since(start).Milliseconds(), "ip", ip)
 		}()
 
 		h := w.Header()
@@ -78,7 +86,7 @@ func (a *App) middleware(next http.Handler) http.Handler {
 			return // preflight answered
 		}
 
-		if ok, wait := a.limiter.allow(clientIP(r)); !ok {
+		if ok, wait := a.limiter.allow(ip); !ok {
 			h.Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
 			a.fail(&Ctx{Request: r, Writer: w, RequestID: id}, Error(http.StatusTooManyRequests, "slow down"))
 			return

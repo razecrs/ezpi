@@ -62,6 +62,29 @@ You can also pass a plain value instead of a function: `app.Get("/health", "ok")
 
 Bad handlers (wrong param count, typo in an `ez` tag, ...) crash at startup with a clear message, never in the middle of a live request.
 
+## Groups
+
+```go
+v1 := app.Group("/v1")
+v1.Get("/users", listUsers)            // GET /v1/users
+
+admin := app.Private.Group("/admin")   // every route here needs a token
+admin.Get("/stats", stats)             // GET /admin/stats
+```
+
+## API docs, generated for you
+
+```go
+app.Docs("/docs")
+
+app.Get("/todos/:id", getTodo).Doc("Get a todo")
+app.Post("/todos", createTodo).Doc("Create a todo").Tags("todos")
+```
+
+Open `/docs` for interactive Swagger UI docs, or grab the spec at `/docs/openapi.json` (OpenAPI 3.1). Everything comes from your code: param types, request and response structs, `ez` rules (`max=100` becomes `maxLength: 100`), status codes, and which routes need a token. The docs can't drift from the code.
+
+Docs are **off by default**, since they map out your whole API. Decide whether you want them public in production. The docs page loads Swagger UI from jsdelivr under a strict CSP that only allows that CDN and the page's own script.
+
 ## Errors
 
 ```go
@@ -144,6 +167,16 @@ Clients send `Authorization: Bearer <token>`. Tokens are HS256 JWTs signed with 
 - **`Cache-Control: no-store`** on private responses
 - **Graceful shutdown** on Ctrl+C or SIGTERM
 
+## Behind a proxy
+
+If you deploy behind nginx, Cloudflare, a load balancer, Fly, Render and so on, tell ezpi so it reads the real client IP from `X-Forwarded-For`:
+
+```go
+app.TrustProxy()
+```
+
+Without this, every request looks like it came from your proxy, so the rate limit would hit all users at once. **Only** turn it on when a proxy really is in front. Otherwise clients can fake their IP and dodge the rate limit. ezpi uses the rightmost `X-Forwarded-For` entry, which is the one your proxy added, so values sent by the client are ignored.
+
 ## Running
 
 `app.Start()` listens on `$PORT` (default `8080`). Use `app.Run(":3000")` if you want the error back instead of exiting.
@@ -155,10 +188,9 @@ w := httptest.NewRecorder()
 app.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
 ```
 
-See [`examples/basic`](examples/basic/main.go) for a full todo API with login.
+See [`examples/basic`](examples/basic/main.go) for a full todo API with login and docs.
 
 ## Notes
 
 - Go can't see parameter names, so URL params are matched **by order**.
 - Add `json:"name"` tags if you want lowercase field names in responses. Input matching is case-insensitive either way.
-- The rate limiter uses the connection IP and ignores `X-Forwarded-For`, which anyone can fake. Behind a proxy, all traffic will look like it comes from one IP for now.

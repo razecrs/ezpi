@@ -40,10 +40,17 @@ type arg struct {
 
 // build checks the handler's signature once, at startup, and returns an
 // http.Handler that calls it. Bad signatures fail here instead of at request time.
-func (a *App) build(method string, params []string, private bool, handler any) (http.Handler, error) {
+func (a *App) build(rt *Route, params []string, handler any) (http.Handler, error) {
+	method, private := rt.method, rt.private
+	rt.status = http.StatusOK
+	if method == http.MethodPost {
+		rt.status = http.StatusCreated
+	}
+
 	fn := reflect.ValueOf(handler)
 	if fn.Kind() != reflect.Func {
 		// A plain value: app.Get("/health", "ok")
+		rt.output = reflect.TypeOf(handler)
 		return a.wrap(private, func(c *Ctx) {
 			a.respond(c, http.StatusOK, handler)
 		}), nil
@@ -73,11 +80,14 @@ func (a *App) build(method string, params []string, private bool, handler any) (
 			}
 			hasInput = true
 			args[i] = arg{kind: argInput, typ: in}
+			rt.input = derefType(in)
+			rt.inQuery = method == http.MethodGet || method == http.MethodDelete
 		case isScalar(in):
 			if pathIdx >= len(params) {
 				return nil, fmt.Errorf("argument %d (%s) has no matching :param in the path", i+1, in)
 			}
 			args[i] = arg{kind: argPath, typ: in, param: params[pathIdx]}
+			rt.params = append(rt.params, pathParam{name: params[pathIdx], typ: in})
 			pathIdx++
 		default:
 			return nil, fmt.Errorf("unsupported argument type %s", in)
@@ -93,11 +103,12 @@ func (a *App) build(method string, params []string, private bool, handler any) (
 		t.NumOut() == 2 && t.Out(0) == errorType:
 		return nil, errors.New("handler must return nothing, a value, an error, or (value, error)")
 	}
-
-	success := http.StatusOK
-	if method == http.MethodPost {
-		success = http.StatusCreated
+	if t.NumOut() > 0 && t.Out(0) != errorType {
+		rt.output = t.Out(0)
+	} else {
+		rt.status = http.StatusNoContent
 	}
+	success := rt.status
 
 	return a.wrap(private, func(c *Ctx) {
 		in := make([]reflect.Value, len(args))
@@ -116,7 +127,6 @@ func (a *App) build(method string, params []string, private bool, handler any) (
 		}
 
 		var result any
-		hasResult := false
 		for _, o := range out {
 			if o.Type() == errorType {
 				if !o.IsNil() {
@@ -125,13 +135,10 @@ func (a *App) build(method string, params []string, private bool, handler any) (
 				}
 				continue
 			}
-			result, hasResult = o.Interface(), true
+			result = o.Interface()
 		}
 
 		status := success
-		if !hasResult {
-			status = http.StatusNoContent
-		}
 		if c.status != 0 {
 			status = c.status
 		}

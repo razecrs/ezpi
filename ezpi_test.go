@@ -362,3 +362,154 @@ func TestBadHandlersPanicAtStartup(t *testing.T) {
 		})
 	}
 }
+
+func TestGroups(t *testing.T) {
+	a := newApp()
+	v1 := a.Group("/v1")
+	v1.Get("/users", "list")
+	v1.Get("/", "v1 root")
+	admin := a.Private.Group("/admin/")
+	admin.Get("stats", "secret stuff")
+
+	expect(t, do(t, a, "GET", "/v1/users", ""), 200)
+	expect(t, do(t, a, "GET", "/v1", ""), 200)
+	expect(t, do(t, a, "GET", "/users", ""), 404)
+	expect(t, do(t, a, "GET", "/admin/stats", ""), 401) // private group stays private
+	tok, _ := a.Token("1")
+	expect(t, do(t, a, "GET", "/admin/stats", "", "Authorization", "Bearer "+tok), 200)
+}
+
+func TestTrustProxy(t *testing.T) {
+	a := newApp()
+	a.Get("/ip", func(c *Ctx) string { return c.IP() })
+
+	// Without TrustProxy, a faked header is ignored.
+	r := do(t, a, "GET", "/ip", "", "X-Forwarded-For", "6.6.6.6")
+	if strings.TrimSpace(r.raw) != `"192.0.2.1"` { // httptest's RemoteAddr
+		t.Fatalf("ip = %s", r.raw)
+	}
+
+	// With it, the rightmost entry (added by our proxy) wins over client-sent ones.
+	a.TrustProxy()
+	r = do(t, a, "GET", "/ip", "", "X-Forwarded-For", "6.6.6.6, 203.0.113.9")
+	if strings.TrimSpace(r.raw) != `"203.0.113.9"` {
+		t.Fatalf("ip = %s", r.raw)
+	}
+
+	// Rate limit follows the proxied IP.
+	a.RateLimit(1)
+	expect(t, do(t, a, "GET", "/ip", "", "X-Forwarded-For", "203.0.113.1"), 200)
+	expect(t, do(t, a, "GET", "/ip", "", "X-Forwarded-For", "203.0.113.2"), 200)
+	expect(t, do(t, a, "GET", "/ip", "", "X-Forwarded-For", "203.0.113.1"), 429)
+}
+
+func TestOpenAPI(t *testing.T) {
+	type Address struct {
+		City string `json:"city" ez:"required"`
+	}
+	type Todo struct {
+		ID      int      `json:"id"`
+		Title   string   `json:"title" ez:"required,max=100"`
+		Kind    string   `json:"kind" ez:"oneof=home|work"`
+		Tags    []string `json:"tags" ez:"max=5"`
+		Email   string   `json:"email,omitempty" ez:"email"`
+		Address *Address `json:"address"`
+		Secret  string   `json:"-"`
+	}
+	type Search struct {
+		Q     string `ez:"required"`
+		Limit int    `ez:"max=50"`
+	}
+	a := newApp()
+	a.Docs("/docs")
+	a.Get("/todos", func(s Search) []Todo { return nil }).Doc("Search todos")
+	a.Get("/todos/:id", func(id int) (Todo, error) { return Todo{}, nil })
+	a.Private.Post("/todos", func(t Todo) Todo { return t }).Tags("writes")
+	a.Delete("/todos/:id", func(id int) error { return nil })
+
+	r := do(t, a, "GET", "/docs/openapi.json", "")
+	expect(t, r, 200)
+	var spec struct {
+		OpenAPI    string `json:"openapi"`
+		Paths      map[string]map[string]map[string]any
+		Components struct {
+			Schemas map[string]map[string]any
+		}
+	}
+	if err := json.Unmarshal([]byte(r.raw), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.OpenAPI != "3.1.0" || len(spec.Paths) != 2 {
+		t.Fatalf("spec = %s", r.raw)
+	}
+	if _, ok := spec.Paths["/docs"]; ok {
+		t.Fatal("docs routes should not be in the spec")
+	}
+
+	list := spec.Paths["/todos"]["get"]
+	if list["summary"] != "Search todos" || fmt.Sprint(list["tags"]) != "[todos]" {
+		t.Fatalf("list op = %v", list)
+	}
+	if got := fmt.Sprint(list["parameters"]); !strings.Contains(got, "name:q") || !strings.Contains(got, "maximum:50") {
+		t.Fatalf("query params = %s", got)
+	}
+
+	create := spec.Paths["/todos"]["post"]
+	resp := create["responses"].(map[string]any)
+	if resp["201"] == nil || resp["401"] == nil || create["security"] == nil || fmt.Sprint(create["tags"]) != "[writes]" {
+		t.Fatalf("create op = %v", create)
+	}
+
+	del := spec.Paths["/todos/{id}"]["delete"]["responses"].(map[string]any)
+	if del["204"] == nil {
+		t.Fatalf("delete responses = %v", del)
+	}
+
+	todo := spec.Components.Schemas["Todo"]
+	props := todo["properties"].(map[string]any)
+	if _, leaked := props["Secret"]; leaked {
+		t.Fatal(`json:"-" field in schema`)
+	}
+	title := props["title"].(map[string]any)
+	kind := props["kind"].(map[string]any)
+	tags := props["tags"].(map[string]any)
+	email := props["email"].(map[string]any)
+	if title["maxLength"] != float64(100) || fmt.Sprint(kind["enum"]) != "[home work]" ||
+		tags["maxItems"] != float64(5) || email["format"] != "email" ||
+		fmt.Sprint(todo["required"]) != "[title]" {
+		t.Fatalf("Todo schema = %v", todo)
+	}
+	if props["address"].(map[string]any)["$ref"] != "#/components/schemas/Address" {
+		t.Fatalf("address = %v", props["address"])
+	}
+
+	page := do(t, a, "GET", "/docs", "")
+	expect(t, page, 200)
+	csp := page.hdr.Get("Content-Security-Policy")
+	_, scriptSrc, _ := strings.Cut(csp, "script-src")
+	if !strings.Contains(page.raw, "/docs/openapi.json") || !strings.Contains(scriptSrc, "'sha256-") ||
+		strings.Contains(scriptSrc, "unsafe") {
+		t.Fatalf("docs page csp = %s", csp)
+	}
+}
+
+func TestDocsOffByDefault(t *testing.T) {
+	a := newApp()
+	a.Get("/x", "ok")
+	expect(t, do(t, a, "GET", "/docs", ""), 404)
+	expect(t, do(t, a, "GET", "/docs/openapi.json", ""), 404)
+}
+
+func TestRecursiveTypesInSpec(t *testing.T) {
+	type Node struct {
+		Name     string  `json:"name"`
+		Children []*Node `json:"children"`
+	}
+	a := newApp()
+	a.Get("/tree", func() Node { return Node{} })
+	spec := a.OpenAPI() // must not loop forever
+	schemas := spec["components"].(map[string]any)["schemas"].(map[string]any)
+	if schemas["Node"] == nil {
+		t.Fatal("Node schema missing")
+	}
+}

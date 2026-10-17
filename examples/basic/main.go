@@ -25,6 +25,7 @@ var (
 
 func main() {
 	app := ezpi.New()
+	app.Docs("/docs") // interactive docs at /docs
 
 	app.Get("/health", "ok")
 
@@ -34,7 +35,7 @@ func main() {
 		}
 		token, err := app.Token(l.Username)
 		return map[string]string{"token": token}, err
-	})
+	}).Doc("Log in and get a token")
 
 	app.Get("/todos/:id", func(id int) (Todo, error) {
 		mu.Lock()
@@ -44,7 +45,7 @@ func main() {
 			return Todo{}, ezpi.NotFound("todo not found")
 		}
 		return t, nil
-	})
+	}).Doc("Get a todo")
 
 	app.Private.Post("/todos", func(t Todo) Todo {
 		mu.Lock()
@@ -53,7 +54,7 @@ func main() {
 		next++
 		todos[t.ID] = t
 		return t
-	})
+	}).Doc("Create a todo")
 
 	app.Private.Get("/me", func(user ezpi.User) string {
 		return "hi " + user.ID
