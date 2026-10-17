@@ -83,7 +83,7 @@ app.Post("/todos", createTodo).Doc("Create a todo").Tags("todos")
 
 Open `/docs` for interactive Swagger UI docs, or grab the spec at `/docs/openapi.json` (OpenAPI 3.1). Everything comes from your code: param types, request and response structs, `ez` rules (`max=100` becomes `maxLength: 100`), status codes, and which routes need a token. The docs can't drift from the code.
 
-Docs are **off by default**, since they map out your whole API. Decide whether you want them public in production. The docs page loads Swagger UI from jsdelivr under a strict CSP that only allows that CDN and the page's own script.
+Docs are **off by default**, since they map out your whole API. Decide whether you want them public in production. The docs page loads Swagger UI from jsdelivr under a strict CSP that allows only those two exact files and the page's own script, not the rest of the CDN.
 
 ## Errors
 
@@ -153,12 +153,16 @@ app.Private.Get("/me", func(user ezpi.User) string { return user.ID })
 
 Clients send `Authorization: Bearer <token>`. Tokens are HS256 JWTs signed with `EZPI_SECRET`, which must be at least 32 characters (`openssl rand -hex 32`). The app **refuses to start** with private routes and a weak or missing secret. Tokens last 24h by default (`app.TokenTTL(...)`).
 
+Things to know:
+- **Tokens can't be revoked early.** A token stays valid until it expires, so there's no "log out everywhere" yet. Keep `TokenTTL` short if that matters to you. Changing `EZPI_SECRET` logs out everyone.
+- **Use a different secret per service.** Tokens don't record which service they're for, so two apps sharing one `EZPI_SECRET` accept each other's tokens.
+
 ## Security that's on by default
 
 - **Headers:** HSTS, CSP, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, COOP
 - **Server timeouts** (read, write, idle, headers): protects against slow-client attacks
 - **1 MB body limit**, configurable with `app.MaxBody(...)`
-- **Rate limit:** 300 requests per minute per IP, configurable with `app.RateLimit(...)`; `0` turns it off
+- **Rate limit:** 300 requests per minute per IP, configurable with `app.RateLimit(...)`; `0` turns it off. IPv6 clients are limited per /64 block, because one user can rotate through a whole block. Memory is capped: during a flood of new IPs, the newcomers share one bucket while known clients keep theirs
 - **Strict JSON:** unknown fields, trailing data and wrong types are rejected; `Content-Type: application/json` is required, which also blocks CSRF-style form posts
 - **CORS denied** unless you allow origins: `app.CORS("https://myapp.com")`
 - **Internal errors and panics hidden**, with a request ID to trace them in the logs
@@ -176,6 +180,8 @@ app.TrustProxy()
 ```
 
 Without this, every request looks like it came from your proxy, so the rate limit would hit all users at once. **Only** turn it on when a proxy really is in front. Otherwise clients can fake their IP and dodge the rate limit. ezpi uses the rightmost `X-Forwarded-For` entry, which is the one your proxy added, so values sent by the client are ignored.
+
+This assumes exactly **one** proxy. With a chain (for example Cloudflare → nginx → your app), the rightmost entry is the first proxy's IP, so every user would share one rate limit. For now, set up your outer proxy to pass the real client IP through to the inner one.
 
 ## Running
 

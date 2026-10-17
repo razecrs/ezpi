@@ -513,3 +513,100 @@ func TestRecursiveTypesInSpec(t *testing.T) {
 		t.Fatal("Node schema missing")
 	}
 }
+
+func hitFrom(a *App, remoteAddr string) int {
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.RemoteAddr = remoteAddr
+	w := httptest.NewRecorder()
+	a.ServeHTTP(w, req)
+	return w.Code
+}
+
+func TestRateLimitIPv6Block(t *testing.T) {
+	a := newApp()
+	a.RateLimit(1)
+	a.Get("/x", "ok")
+
+	// Rotating addresses inside one /64 must not reset the limit.
+	allowed := 0
+	for i := 1; i <= 50; i++ {
+		if hitFrom(a, fmt.Sprintf("[2001:db8:1:1::%x]:1234", i)) == 200 {
+			allowed++
+		}
+	}
+	if allowed != 1 {
+		t.Fatalf("one /64 got %d requests through, want 1", allowed)
+	}
+
+	// A different /64 is a different client.
+	if code := hitFrom(a, "[2001:db8:1:2::1]:1234"); code != 200 {
+		t.Fatalf("other /64 got %d", code)
+	}
+	// IPv4 addresses still count one by one.
+	if hitFrom(a, "198.51.100.1:1") != 200 || hitFrom(a, "198.51.100.2:1") != 200 {
+		t.Fatal("separate IPv4 addresses should each be allowed")
+	}
+}
+
+func TestLimitKey(t *testing.T) {
+	cases := map[string]string{
+		"203.0.113.7":          "203.0.113.7",
+		"::ffff:203.0.113.7":   "::ffff:203.0.113.7", // IPv4-mapped: per address
+		"2001:db8:a:b:1:2:3:4": "2001:db8:a:b::/64",
+		"2001:db8:a:b::ffff":   "2001:db8:a:b::/64",
+		"not-an-ip":            "not-an-ip",
+	}
+	for in, want := range cases {
+		if got := limitKey(in); got != want {
+			t.Errorf("limitKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRateLimitMemoryCap(t *testing.T) {
+	old := maxBuckets
+	maxBuckets = 10
+	defer func() { maxBuckets = old }()
+
+	a := newApp()
+	a.RateLimit(5)
+	a.Get("/x", "ok")
+
+	// Known client before the flood.
+	if hitFrom(a, "192.0.2.200:1") != 200 {
+		t.Fatal("known client blocked")
+	}
+	// Flood of distinct IPs: the table must stay capped, and the new IPs
+	// share one overflow bucket of 5 requests.
+	allowed := 0
+	for i := 1; i <= 100; i++ {
+		if hitFrom(a, fmt.Sprintf("10.0.%d.%d:1", i/250, i%250)) == 200 {
+			allowed++
+		}
+	}
+	if n := len(a.limiter.buckets); n > maxBuckets+1 { // +1 for the overflow bucket
+		t.Fatalf("limiter tracks %d clients, cap is %d", n, maxBuckets)
+	}
+	if want := 9 + 5; allowed != want { // 9 free slots, then 5 from the overflow bucket
+		t.Fatalf("flood got %d requests through, want %d", allowed, want)
+	}
+	// The known client keeps its own bucket.
+	if hitFrom(a, "192.0.2.200:1") != 200 {
+		t.Fatal("known client blocked during flood")
+	}
+}
+
+func TestDocsCSPPinsExactFiles(t *testing.T) {
+	a := newApp()
+	a.Docs("/docs")
+	csp := do(t, a, "GET", "/docs", "").hdr.Get("Content-Security-Policy")
+	_, scriptSrc, _ := strings.Cut(csp, "script-src")
+	for _, src := range strings.Fields(scriptSrc) {
+		if src == "https://cdn.jsdelivr.net" || strings.HasSuffix(src, "/") {
+			t.Fatalf("script-src allows a whole host or folder: %s", csp)
+		}
+	}
+	if !strings.Contains(scriptSrc, docsJS) || !strings.Contains(csp, "style-src "+docsCSS) {
+		t.Fatalf("csp = %s", csp)
+	}
+}

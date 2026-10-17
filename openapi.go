@@ -59,8 +59,10 @@ func (a *App) Docs(path string) {
 	})
 
 	page := strings.ReplaceAll(docsHTML, "{{SPEC}}", specPath)
+	// Allow only the two exact Swagger UI files, not all of jsdelivr: the CDN
+	// serves anyone's packages, and this page shares your API's origin.
 	pageCSP := "default-src 'none'; frame-ancestors 'none'; connect-src 'self'; img-src 'self' data:; " +
-		"style-src " + docsCDN + " 'unsafe-inline'; script-src " + docsCDN + " '" + docsScriptHash(page) + "'"
+		"style-src " + docsCSS + " 'unsafe-inline'; script-src " + docsJS + " '" + docsScriptHash(page) + "'"
 	pagePattern, _ := convertPath(path)
 	a.mux.HandleFunc("GET "+pagePattern, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -69,7 +71,10 @@ func (a *App) Docs(path string) {
 	})
 }
 
-const docsCDN = "https://cdn.jsdelivr.net"
+const (
+	docsJS  = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"
+	docsCSS = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css"
+)
 
 const docsHTML = `<!doctype html>
 <html>
@@ -77,11 +82,11 @@ const docsHTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>API docs</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css">
+<link rel="stylesheet" href="` + docsCSS + `">
 </head>
 <body>
 <div id="docs"></div>
-<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+<script src="` + docsJS + `"></script>
 <script>SwaggerUIBundle({ url: "{{SPEC}}", dom_id: "#docs", persistAuthorization: false });</script>
 </body>
 </html>`
